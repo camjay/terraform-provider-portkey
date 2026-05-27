@@ -56,22 +56,24 @@ type integrationResource struct {
 
 // integrationResourceModel maps the resource schema data.
 type integrationResourceModel struct {
-	ID             types.String `tfsdk:"id"`
-	Slug           types.String `tfsdk:"slug"`
-	Name           types.String `tfsdk:"name"`
-	AIProviderID   types.String `tfsdk:"ai_provider_id"`
-	Key            types.String `tfsdk:"key"`
-	KeyWriteOnly   types.String `tfsdk:"key_wo"`
-	KeyVersion     types.Int64  `tfsdk:"key_version"`
-	Configurations types.String `tfsdk:"configurations"`
-	Description    types.String `tfsdk:"description"`
-	WorkspaceID    types.String `tfsdk:"workspace_id"`
-	AllowAllModels types.Bool   `tfsdk:"allow_all_models"`
-	SecretMappings types.Set    `tfsdk:"secret_mappings"`
-	Type           types.String `tfsdk:"type"`
-	Status         types.String `tfsdk:"status"`
-	CreatedAt      types.String `tfsdk:"created_at"`
-	UpdatedAt      types.String `tfsdk:"updated_at"`
+	ID                      types.String `tfsdk:"id"`
+	Slug                    types.String `tfsdk:"slug"`
+	Name                    types.String `tfsdk:"name"`
+	AIProviderID            types.String `tfsdk:"ai_provider_id"`
+	Key                     types.String `tfsdk:"key"`
+	KeyWriteOnly            types.String `tfsdk:"key_wo"`
+	KeyVersion              types.Int64  `tfsdk:"key_version"`
+	Configurations          types.String `tfsdk:"configurations"`
+	ConfigurationsWriteOnly types.String `tfsdk:"configurations_wo"`
+	ConfigurationsVersion   types.Int64  `tfsdk:"configurations_version"`
+	Description             types.String `tfsdk:"description"`
+	WorkspaceID             types.String `tfsdk:"workspace_id"`
+	AllowAllModels          types.Bool   `tfsdk:"allow_all_models"`
+	SecretMappings          types.Set    `tfsdk:"secret_mappings"`
+	Type                    types.String `tfsdk:"type"`
+	Status                  types.String `tfsdk:"status"`
+	CreatedAt               types.String `tfsdk:"created_at"`
+	UpdatedAt               types.String `tfsdk:"updated_at"`
 }
 
 // Metadata returns the resource type name.
@@ -126,9 +128,18 @@ func (r *integrationResource) Schema(_ context.Context, _ resource.SchemaRequest
 				Optional:    true,
 			},
 			"configurations": schema.StringAttribute{
-				Description: "Provider-specific configurations as JSON. For OpenAI: jsonencode({openai_organization = \"org-...\", openai_project = \"proj-...\"}). For AWS Bedrock: jsonencode({aws_role_arn = \"arn:aws:iam::...\", aws_region = \"us-east-1\"}). For Azure OpenAI: jsonencode({azure_auth_mode = \"default\", azure_resource_name = \"...\", azure_deployment_config = [{azure_deployment_name = \"...\", azure_api_version = \"...\", azure_model_slug = \"gpt-4\", is_default = true}]}).",
+				Description: "Provider-specific configurations as JSON. Stored in Terraform state (marked sensitive). Use this for simpler workflows or when state is already secured. For enhanced security where sensitive configuration fields should never be stored in state, use configurations_wo instead. For OpenAI: jsonencode({openai_organization = \"org-...\", openai_project = \"proj-...\"}). For AWS Bedrock: jsonencode({aws_role_arn = \"arn:aws:iam::...\", aws_region = \"us-east-1\"}). For Azure OpenAI: jsonencode({azure_auth_mode = \"default\", azure_resource_name = \"...\", azure_deployment_config = [{azure_deployment_name = \"...\", azure_api_version = \"...\", azure_model_slug = \"gpt-4\", is_default = true}]}).",
 				Optional:    true,
 				Sensitive:   true,
+			},
+			"configurations_wo": schema.StringAttribute{
+				Description: "Provider-specific configurations as JSON (write-only). Never stored in Terraform state or shown in plan output. Requires Terraform 1.11+. Use with configurations_version to control when configurations are sent to the API. Mutually exclusive with configurations. Useful for configurations containing secrets sourced from external systems (e.g. ephemeral Vault reads via TFC dynamic credentials, Doppler/Infisical TF integrations) where the caller wants the secret never to land in state.",
+				Optional:    true,
+				WriteOnly:   true,
+			},
+			"configurations_version": schema.Int64Attribute{
+				Description: "Trigger for applying write-only configurations. Only used with configurations_wo. Increment this value to update the configurations - they are only sent to the API when configurations_version changes.",
+				Optional:    true,
 			},
 			"description": schema.StringAttribute{
 				Description: "Optional description of the integration.",
@@ -279,8 +290,41 @@ func (r *integrationResource) Create(ctx context.Context, req resource.CreateReq
 		createReq.Key = plan.Key.ValueString()
 	}
 
-	// Parse configurations JSON if provided
-	if !plan.Configurations.IsNull() && !plan.Configurations.IsUnknown() {
+	// Validate: cannot use both configurations and configurations_wo
+	hasConfigurations := !plan.Configurations.IsNull() && !plan.Configurations.IsUnknown()
+	hasConfigurationsWO := !config.ConfigurationsWriteOnly.IsNull() && !config.ConfigurationsWriteOnly.IsUnknown()
+
+	if hasConfigurations && hasConfigurationsWO {
+		resp.Diagnostics.AddError(
+			"Conflicting Configurations Attributes",
+			"Cannot specify both 'configurations' and 'configurations_wo'. Choose one: 'configurations' (stored in state, simpler) or 'configurations_wo' (write-only, enhanced security for configurations containing secrets).",
+		)
+		return
+	}
+
+	// Warn if configurations_wo is used without configurations_version (configurations cannot be updated after creation)
+	if hasConfigurationsWO && plan.ConfigurationsVersion.IsNull() {
+		resp.Diagnostics.AddWarning(
+			"Missing configurations_version",
+			"Using configurations_wo without configurations_version means configurations cannot be updated after initial creation. Consider adding configurations_version to enable configuration updates.",
+		)
+	}
+
+	// Use configurations_wo (write-only) if provided, otherwise fall back to configurations
+	if hasConfigurationsWO {
+		tflog.Debug(ctx, "Creating integration with write-only configurations (configurations_wo)", map[string]interface{}{
+			"integration_name": plan.Name.ValueString(),
+		})
+		var configurations map[string]interface{}
+		if err := json.Unmarshal([]byte(config.ConfigurationsWriteOnly.ValueString()), &configurations); err != nil {
+			resp.Diagnostics.AddError(
+				"Invalid configurations_wo JSON",
+				"Could not parse configurations_wo: "+err.Error(),
+			)
+			return
+		}
+		createReq.Configurations = configurations
+	} else if hasConfigurations {
 		var configurations map[string]interface{}
 		if err := json.Unmarshal([]byte(plan.Configurations.ValueString()), &configurations); err != nil {
 			resp.Diagnostics.AddError(
@@ -568,8 +612,53 @@ func (r *integrationResource) Update(ctx context.Context, req resource.UpdateReq
 		updateReq.Key = plan.Key.ValueString()
 	}
 
-	// Parse configurations JSON if provided
-	if !plan.Configurations.IsNull() && !plan.Configurations.IsUnknown() {
+	// Validate: cannot use both configurations and configurations_wo
+	hasConfigurations := !plan.Configurations.IsNull() && !plan.Configurations.IsUnknown()
+	hasConfigurationsWO := !config.ConfigurationsWriteOnly.IsNull() && !config.ConfigurationsWriteOnly.IsUnknown()
+
+	if hasConfigurations && hasConfigurationsWO {
+		resp.Diagnostics.AddError(
+			"Conflicting Configurations Attributes",
+			"Cannot specify both 'configurations' and 'configurations_wo'. Choose one: 'configurations' (stored in state, simpler) or 'configurations_wo' (write-only, enhanced security for configurations containing secrets).",
+		)
+		return
+	}
+
+	// Warn if configurations_wo is used without configurations_version (configurations cannot be updated)
+	if hasConfigurationsWO && plan.ConfigurationsVersion.IsNull() {
+		resp.Diagnostics.AddWarning(
+			"Missing configurations_version",
+			"Using configurations_wo without configurations_version means configurations cannot be updated after initial creation. Consider adding configurations_version to enable configuration updates.",
+		)
+	}
+
+	// Handle configurations updates:
+	// - For configurations_wo (write-only): only send if configurations_version changed (trigger-based)
+	// - For configurations: send if provided
+	if hasConfigurationsWO {
+		configurationsVersionChanged := !plan.ConfigurationsVersion.Equal(state.ConfigurationsVersion)
+		if configurationsVersionChanged {
+			tflog.Debug(ctx, "Updating integration configurations (configurations_version changed)", map[string]interface{}{
+				"integration_name":           plan.Name.ValueString(),
+				"old_configurations_version": state.ConfigurationsVersion.ValueInt64(),
+				"new_configurations_version": plan.ConfigurationsVersion.ValueInt64(),
+			})
+			var configurations map[string]interface{}
+			if err := json.Unmarshal([]byte(config.ConfigurationsWriteOnly.ValueString()), &configurations); err != nil {
+				resp.Diagnostics.AddError(
+					"Invalid configurations_wo JSON",
+					"Could not parse configurations_wo: "+err.Error(),
+				)
+				return
+			}
+			updateReq.Configurations = configurations
+		} else {
+			tflog.Debug(ctx, "Skipping configurations update (configurations_version unchanged)", map[string]interface{}{
+				"integration_name":       plan.Name.ValueString(),
+				"configurations_version": plan.ConfigurationsVersion.ValueInt64(),
+			})
+		}
+	} else if hasConfigurations {
 		var configurations map[string]interface{}
 		if err := json.Unmarshal([]byte(plan.Configurations.ValueString()), &configurations); err != nil {
 			resp.Diagnostics.AddError(

@@ -88,3 +88,42 @@ variable "aws_secret_access_key" {
   type      = string
   sensitive = true
 }
+
+# ----------------------------------------------------------------------------
+# Write-only configurations.
+#
+# When the caller's pipeline already has access to a secret manager (e.g.
+# HashiCorp Vault via TFC dynamic credentials, Doppler/Infisical via their
+# Terraform integrations), `configurations_wo` lets the resolved values flow
+# into Portkey without ever landing in Terraform state. This is complementary
+# to `portkey_secret_reference` — use that when Portkey itself should resolve
+# the secret at request time; use `configurations_wo` when the secret is
+# resolved at apply time and you just want to keep it out of state.
+#
+# Mutually exclusive with `configurations`. Increment `configurations_version`
+# to trigger an update.
+# ----------------------------------------------------------------------------
+
+# Example: ephemeral Vault read via TFC dynamic credentials, fed into a Vertex
+# AI integration's `vertex_service_account_json` field without state storage.
+ephemeral "vault_kv_secret_v2" "vertex" {
+  mount = "secret"
+  name  = "portkey/integrations/vertex-prod"
+}
+
+resource "portkey_integration" "vertex_write_only_configurations" {
+  name           = "vertex-production-wo"
+  ai_provider_id = "vertex-ai"
+  key_wo         = "unused-placeholder" # vertex auths via configurations
+  key_version    = 1
+
+  configurations_wo = jsonencode({
+    vertex_auth_type            = "serviceAccount"
+    vertex_region               = "us-central1"
+    vertex_project_id           = ephemeral.vault_kv_secret_v2.vertex.data["vertex_project_id"]
+    vertex_service_account_json = ephemeral.vault_kv_secret_v2.vertex.data["vertex_service_account_json"]
+  })
+
+  # Bump configurations_version to push a refreshed value through to Portkey.
+  configurations_version = 1
+}

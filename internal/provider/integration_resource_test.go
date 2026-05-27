@@ -35,12 +35,12 @@ func TestAccIntegrationResource_basic(t *testing.T) {
 				ResourceName:      "portkey_integration.test",
 				ImportState:       true,
 				ImportStateVerify: true,
-				// key, key_wo: write-only, never returned by API
-				// key_version: not stored on server, local trigger only
+				// key, key_wo, configurations_wo: write-only, never returned by API
+				// key_version, configurations_version: not stored on server, local triggers only
 				// configurations: not returned by API
 				// slug: BUG - API returns UUID instead of original slug on GET (needs investigation)
 				// updated_at: timestamp may change between operations
-				ImportStateVerifyIgnore: []string{"key", "key_wo", "key_version", "configurations", "slug", "updated_at"},
+				ImportStateVerifyIgnore: []string{"key", "key_wo", "key_version", "configurations", "configurations_wo", "configurations_version", "slug", "updated_at"},
 			},
 			// Update testing
 			{
@@ -707,4 +707,158 @@ resource "portkey_integration" "test" {
   workspace_id   = %[2]q
 }
 `, name, workspaceID)
+}
+
+// Tests for write-only configurations (configurations_wo) and configurations_version trigger
+//
+// configurations_wo mirrors key_wo: it accepts a JSON string that is written
+// to Portkey but never stored in Terraform state. Use it when callers want
+// to source sensitive configuration fields from external secret pipelines
+// (e.g. ephemeral Vault reads via TFC dynamic credentials, Doppler/Infisical
+// TF integrations) without those values landing in TF state.
+
+func TestAccIntegrationResource_withWriteOnlyConfigurations(t *testing.T) {
+	rName := acctest.RandomWithPrefix("tf-acc-wo-cfg")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			// Create with configurations_wo and configurations_version
+			{
+				Config: testAccIntegrationResourceConfigWithWriteOnlyConfigurations(rName, "org-test-1", 1),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrSet("portkey_integration.test", "id"),
+					resource.TestCheckResourceAttr("portkey_integration.test", "name", rName),
+					resource.TestCheckResourceAttr("portkey_integration.test", "configurations_version", "1"),
+					// configurations_wo never appears in state
+					resource.TestCheckNoResourceAttr("portkey_integration.test", "configurations_wo"),
+				),
+			},
+			// Update configurations_version to trigger configurations update
+			{
+				Config: testAccIntegrationResourceConfigWithWriteOnlyConfigurations(rName, "org-test-2", 2),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("portkey_integration.test", "name", rName),
+					resource.TestCheckResourceAttr("portkey_integration.test", "configurations_version", "2"),
+				),
+			},
+		},
+	})
+}
+
+func TestAccIntegrationResource_configurationsVersionNoChange(t *testing.T) {
+	rName := acctest.RandomWithPrefix("tf-acc-no-cfg-change")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			// Create
+			{
+				Config: testAccIntegrationResourceConfigWithWriteOnlyConfigurations(rName, "org-test", 1),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("portkey_integration.test", "configurations_version", "1"),
+				),
+			},
+			// Update name but not configurations_version - configurations should NOT be re-sent
+			{
+				Config: testAccIntegrationResourceConfigWithWriteOnlyConfigurations(rName+"-updated", "org-test", 1),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("portkey_integration.test", "name", rName+"-updated"),
+					resource.TestCheckResourceAttr("portkey_integration.test", "configurations_version", "1"),
+				),
+			},
+		},
+	})
+}
+
+func TestAccIntegrationResource_conflictConfigurationsAndConfigurationsWO(t *testing.T) {
+	rName := acctest.RandomWithPrefix("tf-acc-conflict-cfg")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config:      testAccIntegrationResourceConfigConflictConfigurations(rName),
+				ExpectError: regexp.MustCompile(`Conflicting Configurations Attributes`),
+			},
+		},
+	})
+}
+
+// Test configurations_wo without configurations_version - should create successfully with warning
+func TestAccIntegrationResource_withWriteOnlyConfigurationsNoVersion(t *testing.T) {
+	rName := acctest.RandomWithPrefix("tf-acc-wo-cfg-no-ver")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			// Create with configurations_wo but NO configurations_version - should work (with warning)
+			{
+				Config: testAccIntegrationResourceConfigWithWriteOnlyConfigurationsNoVersion(rName),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrSet("portkey_integration.test", "id"),
+					resource.TestCheckResourceAttr("portkey_integration.test", "name", rName),
+					// configurations_version should remain null
+					resource.TestCheckNoResourceAttr("portkey_integration.test", "configurations_version"),
+				),
+			},
+		},
+	})
+}
+
+func testAccIntegrationResourceConfigWithWriteOnlyConfigurations(name, org string, configVersion int) string {
+	return fmt.Sprintf(`
+provider "portkey" {}
+
+resource "portkey_integration" "test" {
+  name           = %[1]q
+  ai_provider_id = "openai"
+  key_wo         = "sk-test-fake-key-12345"
+  key_version    = 1
+
+  configurations_wo = jsonencode({
+    openai_organization = %[2]q
+    openai_project      = "proj-test"
+  })
+  configurations_version = %[3]d
+}
+`, name, org, configVersion)
+}
+
+func testAccIntegrationResourceConfigConflictConfigurations(name string) string {
+	return fmt.Sprintf(`
+provider "portkey" {}
+
+resource "portkey_integration" "test" {
+  name           = %[1]q
+  ai_provider_id = "openai"
+  key_wo         = "sk-test-fake-key-12345"
+  key_version    = 1
+
+  configurations    = jsonencode({ openai_organization = "org-A" })
+  configurations_wo = jsonencode({ openai_organization = "org-B" })
+}
+`, name)
+}
+
+func testAccIntegrationResourceConfigWithWriteOnlyConfigurationsNoVersion(name string) string {
+	return fmt.Sprintf(`
+provider "portkey" {}
+
+resource "portkey_integration" "test" {
+  name           = %[1]q
+  ai_provider_id = "openai"
+  key_wo         = "sk-test-fake-key-12345"
+  key_version    = 1
+
+  configurations_wo = jsonencode({
+    openai_organization = "org-test"
+    openai_project      = "proj-test"
+  })
+}
+`, name)
 }

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Write-only configurations support** — `portkey_integration` now supports `configurations_wo` and `configurations_version`, mirroring the existing `key_wo` / `key_version` pattern (added in 0.2.8):
+  - `configurations_wo` (String, Write-Only) — Provider-specific configurations as JSON. Never stored in Terraform state or shown in plan output. Requires Terraform 1.11+.
+  - `configurations_version` (Number) — Increment to trigger a configurations update; the value is only sent to the API when this changes.
+  - Mutually exclusive with `configurations`. Existing configs using `configurations` see no behavior change.
+  - Useful for configurations containing secrets sourced from external secret pipelines (e.g. ephemeral Vault reads via TFC dynamic credentials, Doppler/Infisical TF integrations) where the caller wants the secret never to land in state.
+  - `portkey_secret_reference` + `secret_mappings` (added in earlier releases) remain the recommended path for customers who can give Portkey native access to AWS Secrets Manager / Azure Key Vault / HashiCorp Vault. `configurations_wo` covers the complementary case where the caller's CI/CD already has secret-manager access and wants to inject the resolved value through Terraform without persisting it.
+
 ## [0.2.25] - 2026-05-22
 
 ### Added
